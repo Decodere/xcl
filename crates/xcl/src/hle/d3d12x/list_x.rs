@@ -2093,11 +2093,20 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
 /// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
-pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
-    if lists.is_empty() {
+pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], submit: impl FnMut(&[*mut c_void])) {
+    execute_with_waits_on_with(queue, lists, kickoff_swap_enabled(), submit);
+}
+
+unsafe fn execute_with_waits_on_with(
+    queue: *mut c_void,
+    lists: &[*mut c_void],
+    skip_empty: bool,
+    mut submit: impl FnMut(&[*mut c_void]),
+) {
+    if skip_empty && lists.is_empty() {
         return;
     }
-    if PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
+    if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
     }
@@ -3302,13 +3311,12 @@ unsafe fn acquire_kickoff_target(
     mut wait_idle: impl FnMut(*mut c_void) -> bool,
     mut reset_one: impl FnMut(*mut c_void) -> i32,
 ) -> Result<*mut c_void, i32> {
-    const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
+    const HRESULT_WAIT_TIMEOUT: i32 = 0x8007_0102u32 as i32;
     let Some(w) = wrapper.filter(|_| swap_enabled) else {
         let hr = reset_one(current_target);
         return if hr >= 0 { Ok(current_target) } else { Err(hr) };
     };
     let primary = super::title_list::primary_of(w);
-    let mut last_err: Option<i32> = None;
 
     if current_target != primary && !in_flight(primary) {
         let hr = reset_one(primary);
@@ -3316,7 +3324,6 @@ unsafe fn acquire_kickoff_target(
             super::title_list::switch_active_for_kickoff(w, current_target, primary);
             return Ok(primary);
         }
-        last_err = Some(hr);
     }
 
     if !in_flight(current_target) {
@@ -3340,7 +3347,6 @@ unsafe fn acquire_kickoff_target(
             switched = Some(cand);
             break;
         }
-        last_err = Some(hr);
         failed_spares.push(cand);
     }
     if switched.is_none() && super::title_list::spare_count(w) + failed_spares.len() < max_spares {
@@ -3350,7 +3356,6 @@ unsafe fn acquire_kickoff_target(
                 if hr >= 0 {
                     switched = Some(cand);
                 } else {
-                    last_err = Some(hr);
                     failed_spares.push(cand);
                 }
             } else {
@@ -3378,7 +3383,7 @@ unsafe fn acquire_kickoff_target(
         return Err(hr);
     }
     super::title_list::mark_kickoff_unreset(w);
-    Err(last_err.unwrap_or(E_OUTOFMEMORY))
+    Err(HRESULT_WAIT_TIMEOUT)
 }
 
 /// command list #93 KickoffX(): flush commands recorded so far by closing the list, submitting
@@ -3506,10 +3511,6 @@ unsafe fn kickoff_x_with(this: *mut c_void, swap_enabled: bool) {
     }
     super::cpu_writes::after(q_raw, cpu_writes);
 
-    let (current_target, prior_retired, reclaimed) = match kickoff_split {
-        Some((primary, prior, reclaimed)) => (primary, prior, reclaimed),
-        None => (this, Vec::new(), Vec::new()),
-    };
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let reset_one = |pc_list: *mut c_void| -> i32 {
         let ext_closed = *(pc_list as *const usize);
@@ -3519,61 +3520,110 @@ unsafe fn kickoff_x_with(this: *mut c_void, swap_enabled: bool) {
         real::preserve_vtable(pc_list, ext_closed);
         hr
     };
-    // When `XCL_KICKOFF_SWAP=1`, avoid resuming on a PC command list whose submit is still in
-    // flight on the GPU (#1452, debug layer id 553): pick `primary` once idle, else an idle spare,
-    // else a fresh closed spare up to `MAX_KICKOFF_SPARES`, else wait on `current_target`'s last
-    // submit fence before resetting it.
-    let target = match acquire_kickoff_target(
-        wrapper,
-        current_target,
-        swap_enabled,
-        MAX_KICKOFF_SPARES,
-        |p| super::alloc_pool::in_flight(p as usize),
-        || create_kickoff_spare(current_target, ty, alloc),
-        |p| device_of(p).is_some_and(|dev| super::alloc_pool::wait_idle(p as usize, &dev, KICKOFF_IDLE_WAIT_MS)),
-        reset_one,
-    ) {
-        Ok(t) => t,
-        Err(reset_hr) => {
-            return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
-        }
-    };
-    if target != this {
-        let (ended_early, pred_buf_obj, bindings_copy) = {
-            let mut g = LISTS.lock().unwrap();
-            if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-                (std::mem::take(&mut s.occlusion.ended_early), s.pred_buf.clone(), s.bindings.clone())
-            } else {
-                (Vec::new(), None, Bindings::default())
-            }
-        };
-        super::bind::inherit_for_split(this, target, alloc);
-        for seg in reclaimed.into_iter().chain(prior_retired.into_iter().map(|p| p as usize)).chain([this as usize]) {
-            if seg != target as usize {
+    let target = if !swap_enabled {
+        // Default OFF: exact `main` hand-over-then-reset order without spare switching.
+        let target = if let Some((primary, _, reclaimed)) = kickoff_split {
+            let (ended_early, pred_buf_obj, bindings_copy) = {
+                let mut g = LISTS.lock().unwrap();
+                if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+                    (std::mem::take(&mut s.occlusion.ended_early), s.pred_buf.clone(), s.bindings.clone())
+                } else {
+                    (Vec::new(), None, Bindings::default())
+                }
+            };
+            super::bind::inherit_for_split(this, primary, alloc);
+            for seg in reclaimed {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 clear_segment_state(seg);
             }
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
+                s.allocator = alloc;
+                s.bound_pso = bound_pso;
+                s.depth_bias = depth_bias;
+                s.index_buffer = index_buffer;
+                s.depth_bounds = depth_bounds;
+                s.predication = predication;
+                s.pred_buf = pred_buf_obj;
+                s.pred_in_state = false;
+                s.occlusion = Occlusion { active: None, ended_early };
+                s.written_ranges.clear();
+                s.clear_sparse_writes();
+                s.clear_write64_signals();
+                s.clear_waits();
+                s.cpu_writes.clear();
+                s.bindings = bindings_copy;
+            }
+            primary
+        } else {
+            this
+        };
+        let reset_hr = reset_one(target);
+        if reset_hr < 0 {
+            return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
         }
-        let mut g = LISTS.lock().unwrap();
-        let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
-        s.allocator = alloc;
-        s.list_type = Some(ty);
-        s.last_queue = last_queue.or(Some(queue));
-        s.bound_pso = bound_pso;
-        s.depth_bias = depth_bias;
-        s.index_buffer = index_buffer;
-        s.depth_bounds = depth_bounds;
-        s.predication = predication;
-        s.pred_buf = pred_buf_obj;
-        s.pred_in_state = false;
-        s.occlusion = Occlusion { active: None, ended_early };
-        s.written_ranges.clear();
-        s.clear_sparse_writes();
-        s.clear_write64_signals();
-        s.clear_waits();
-        s.cpu_writes.clear();
-        s.bindings = bindings_copy;
-    }
+        target
+    } else {
+        let (current_target, prior_retired, reclaimed) = match kickoff_split {
+            Some((primary, prior, reclaimed)) => (primary, prior, reclaimed),
+            None => (this, Vec::new(), Vec::new()),
+        };
+        // When `XCL_KICKOFF_SWAP=1`, avoid resuming on a PC command list whose submit is still in
+        // flight on the GPU (#1452, debug layer id 553): pick `primary` once idle, else an idle spare,
+        // else a fresh closed spare up to `MAX_KICKOFF_SPARES`, else wait on `current_target`'s last
+        // submit fence before resetting it.
+        let target = match acquire_kickoff_target(
+            wrapper,
+            current_target,
+            true,
+            MAX_KICKOFF_SPARES,
+            |p| super::alloc_pool::in_flight(p as usize),
+            || create_kickoff_spare(current_target, ty, alloc),
+            |p| device_of(p).is_some_and(|dev| super::alloc_pool::wait_idle(p as usize, &dev, KICKOFF_IDLE_WAIT_MS)),
+            reset_one,
+        ) {
+            Ok(t) => t,
+            Err(reset_hr) => {
+                return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
+            }
+        };
+        if target != this {
+            let (ended_early, pred_buf_obj, bindings_copy) = {
+                let mut g = LISTS.lock().unwrap();
+                if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+                    (std::mem::take(&mut s.occlusion.ended_early), s.pred_buf.clone(), s.bindings.clone())
+                } else {
+                    (Vec::new(), None, Bindings::default())
+                }
+            };
+            super::bind::inherit_for_split(this, target, alloc);
+            for seg in reclaimed.into_iter().chain(prior_retired.into_iter().map(|p| p as usize)).chain([this as usize]) {
+                if seg != target as usize {
+                    super::bind::reset(seg as *mut c_void, 0, 0);
+                    clear_segment_state(seg);
+                }
+            }
+            let mut g = LISTS.lock().unwrap();
+            let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
+            s.allocator = alloc;
+            s.list_type = Some(ty);
+            s.last_queue = last_queue.or(Some(queue));
+            s.bound_pso = bound_pso;
+            s.depth_bias = depth_bias;
+            s.index_buffer = index_buffer;
+            s.depth_bounds = depth_bounds;
+            s.predication = predication;
+            s.pred_buf = pred_buf_obj;
+            s.pred_in_state = false;
+            s.occlusion = Occlusion { active: None, ended_early };
+            s.written_ranges.clear();
+            s.clear_sparse_writes();
+            s.clear_write64_signals();
+            s.clear_waits();
+            s.cpu_writes.clear();
+            s.bindings = bindings_copy;
+        }
+        target
+    };
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
@@ -7757,6 +7807,7 @@ mod tests {
     #[test]
     fn kickoff_x_failure_paths_never_reset_in_flight_target() {
         const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
+        const HRESULT_WAIT_TIMEOUT: i32 = 0x8007_0102u32 as i32;
         let _guard = KICKOFF_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(dev) = test_device_or_warp() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
         unsafe {
@@ -7780,7 +7831,7 @@ mod tests {
 
             // 1. No pooled spare, `create_spare` fails (`None`), and bounded fence wait fails:
             //    must never call `reset_one(primary)` even though `reset_one` would return `S_OK`,
-            //    and must suppress subsequent submits.
+            //    must return HRESULT_WAIT_TIMEOUT, and must suppress subsequent submits.
             let mut reset_calls = Vec::new();
             let res_no_spare = acquire_kickoff_target(
                 Some(w),
@@ -7792,16 +7843,19 @@ mod tests {
                 |_| false,
                 |p| { reset_calls.push(p); 0 },
             );
-            assert_eq!(res_no_spare, Err(E_OUTOFMEMORY));
+            assert_eq!(res_no_spare, Err(HRESULT_WAIT_TIMEOUT));
             assert!(reset_calls.is_empty(), "in-flight primary must never be reset when spare creation and wait fail");
             let empty = segs();
             assert!(empty.is_empty(), "unreset kickoff wrapper must not expose in-flight primary to ExecuteCommandLists");
             assert!(close(w) < 0, "in-flight primary must remain closed");
             kickoff_x_with(primary, true);
             assert!(segs().is_empty());
-            let mut exec_batches = 0usize;
-            execute_with_waits_on(q_raw, &empty, |_| exec_batches += 1);
-            assert_eq!(exec_batches, 0);
+            let mut exec_batches_opt_in = 0usize;
+            execute_with_waits_on_with(q_raw, &empty, true, |_| exec_batches_opt_in += 1);
+            assert_eq!(exec_batches_opt_in, 0, "opt-in empty batch from kickoff_unreset must be skipped");
+            let mut exec_batches_default = 0usize;
+            execute_with_waits_on_with(q_raw, &empty, false, |_| exec_batches_default += 1);
+            assert_eq!(exec_batches_default, 1, "default-off execute_with_waits_on must preserve main empty-batch call");
 
             // 2. Pooled idle spare `s_fail` fails `Reset` and wait fails: must never fall back to
             //    in-flight `primary`, must return `s_fail` to the spare pool, and keep `push_segments` empty.
@@ -7818,7 +7872,7 @@ mod tests {
                 |_| false,
                 |p| { reset_calls.push(p); if p == s_fail { E_OUTOFMEMORY } else { 0 } },
             );
-            assert_eq!(res_spare_err, Err(E_OUTOFMEMORY));
+            assert_eq!(res_spare_err, Err(HRESULT_WAIT_TIMEOUT));
             assert_eq!(reset_calls, vec![s_fail], "spare Reset failure must not fall back to in-flight primary");
             assert!(segs().is_empty());
 
@@ -8069,6 +8123,70 @@ mod tests {
             let removed = dev.GetDeviceRemovedReason();
             assert_eq!(release(w), 0);
             drop(q);
+            assert!(removed.is_ok());
+        }
+    }
+
+    /// With `XCL_KICKOFF_SWAP` unset/off (`swap_enabled == false`), `kickoff_x_with(seg1, false)`
+    /// on a mid-list split resumes on `primary` using `main`'s exact hand-over-then-reset path:
+    /// no new spare is created, bindings hand over to `primary`, `seg1`'s segment state is cleared,
+    /// and `primary`'s `list_type` / `last_queue` are not overwritten.
+    #[test]
+    fn kickoff_x_default_off_split_list_matches_main_handover() {
+        let _guard = KICKOFF_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = test_device_or_warp() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+        unsafe {
+            let (q, _alloc, primary, w, gate, done) = kickoff_test_setup(&dev);
+            let q_raw = q.as_raw();
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(w as *const *const usize)).add(9));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as u64;
+            note_write64_recorded(primary, va, 1);
+            wait64_x(primary, va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 1, 0, 0);
+            let mut split_segs = Vec::new();
+            assert!(super::super::title_list::push_segments(w, &mut split_segs));
+            assert_eq!(split_segs.len(), 2);
+            let seg1 = split_segs[1];
+            assert!(split_segs[0] == primary && seg1 != primary);
+
+            {
+                let mut g = LISTS.lock().unwrap();
+                let m = g.as_mut().unwrap();
+                let sp = m.get_mut(&(primary as usize)).unwrap();
+                sp.list_type = None;
+                sp.last_queue = Some(0xDEAD);
+                let s1 = m.get_mut(&(seg1 as usize)).unwrap();
+                s1.last_queue = Some(q_raw as usize);
+                s1.bindings.stencil = Some(0x77);
+                s1.bindings.topology = Some(4);
+            }
+
+            q.Wait(&gate, 1).unwrap();
+            kickoff_x_with(seg1, false);
+
+            let mut after = Vec::new();
+            assert!(super::super::title_list::push_segments(w, &mut after));
+            assert_eq!(after, vec![primary], "default-off split KickoffX must resume directly on primary");
+            assert_eq!(super::super::title_list::spare_count(w), 1, "default-off must not allocate a new spare");
+            let primary_state = {
+                let g = LISTS.lock().unwrap();
+                let s = g.as_ref().unwrap().get(&(primary as usize)).unwrap();
+                (s.bindings.stencil, s.bindings.topology, s.list_type, s.last_queue)
+            };
+            assert_eq!(primary_state, (Some(0x77), Some(4), None, Some(0xDEAD)));
+            assert_eq!(close(w), 0);
+
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("default-off split drains");
+            let removed = dev.GetDeviceRemovedReason();
+            assert_eq!(release(w), 0);
+            drop(q);
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va);
+            }
             assert!(removed.is_ok());
         }
     }
