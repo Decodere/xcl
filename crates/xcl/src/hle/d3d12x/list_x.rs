@@ -2589,24 +2589,6 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
 }
 
-/// Create a new adopted PC command list matching `template`'s device and type, closed and ready
-/// for `Reset`. Releases and forgets the list instead of pooling it if `Close` fails.
-unsafe fn create_closed_spare(template: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, alloc: usize) -> Option<*mut c_void> {
-    let pc_alloc = super::alloc_pool::current(alloc);
-    let made = real::create_raw_pc_command_list(device_of(template)?.as_raw(), ty, pc_alloc, 0)?;
-    let ext = *(made as *const usize);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
-    real::preserve_vtable(made, ext);
-    if hr < 0 {
-        super::bind::forget(made);
-        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(made as *const *const usize)).add(2));
-        rel(made);
-        return None;
-    }
-    on_create(made, pc_alloc, 0, ty);
-    Some(made)
-}
-
 /// The title Resets its list (`title_list` `wrapper`) while the GPU has not finished the last
 /// submit of the PC list `primary` behind it: a console lets the title submit the new recording
 /// at once, the PC does not let `primary` be submitted again yet (#1452, debug layer id 553;
@@ -2619,7 +2601,20 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
     }
     let spare = match super::title_list::pop_spare(wrapper) {
         Some(p) => p,
-        None => create_closed_spare(primary, ty, alloc)?,
+        None => {
+            let pc_alloc = super::alloc_pool::current(alloc);
+            let made = real::create_raw_pc_command_list(device_of(primary)?.as_raw(), ty, pc_alloc, 0)?;
+            on_create(made, pc_alloc, 0, ty);
+            // (closed: it is reset below like a spare)
+            let ext = *(made as *const usize);
+            let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
+            real::preserve_vtable(made, ext);
+            if hr < 0 {
+                super::title_list::put_spare(wrapper, made);
+                return None;
+            }
+            made
+        }
     };
     if reset_pc(spare, alloc, pso) < 0 {
         super::title_list::put_spare(wrapper, spare);
@@ -3253,30 +3248,58 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
     apply_predication_copy(this, uma_buf, off, pb, D3D12_PREDICATION_OP(op_raw as i32));
 }
 
+/// Maximum non-primary spares per wrapped command list for `KickoffX` list switching before
+/// falling back to a bounded fence wait on `current_target`.
+const MAX_KICKOFF_SPARES: usize = 8;
+/// Bounded wait on `current_target`'s last submit fence when no idle spare is available.
+const KICKOFF_IDLE_WAIT_MS: u32 = 5_000;
+
 fn kickoff_swap_enabled_val(val: Option<&str>) -> bool {
-    !val.is_some_and(|v| v.trim() == "0")
+    val.is_some_and(|v| v.trim() == "1")
 }
 
-/// `XCL_KICKOFF_SWAP=0` disables switching `KickoffX` onto an idle spare PC list, falling back to
-/// resetting `current_target` directly without affecting `XCL_ALLOC_SWAP`.
+/// `XCL_KICKOFF_SWAP=1` enables switching `KickoffX` onto an idle spare PC list while the
+/// submitted list is still in flight (off by default, leaving `XCL_ALLOC_SWAP` unaffected).
 fn kickoff_swap_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| kickoff_swap_enabled_val(std::env::var("XCL_KICKOFF_SWAP").ok().as_deref()))
 }
 
+/// Create a new adopted PC command list for `KickoffX` matching `template`'s device and type,
+/// closed and ready for `Reset`. Releases and forgets the list instead of pooling it if `Close` fails.
+unsafe fn create_kickoff_spare(template: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, alloc: usize) -> Option<*mut c_void> {
+    let pc_alloc = super::alloc_pool::current(alloc);
+    let made = real::create_raw_pc_command_list(device_of(template)?.as_raw(), ty, pc_alloc, 0)?;
+    let ext = *(made as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
+    real::preserve_vtable(made, ext);
+    if hr < 0 {
+        super::bind::forget(made);
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(made as *const *const usize)).add(2));
+        rel(made);
+        return None;
+    }
+    on_create(made, pc_alloc, 0, ty);
+    Some(made)
+}
+
 /// Select and `Reset` the next active PC command list after `KickoffX` has submitted
-/// `current_target`. When `swap_enabled` is false (`XCL_KICKOFF_SWAP=0`), resets `current_target`
-/// directly without touching spares or switching active backing lists. Otherwise preserves the
-/// idle-list invariant (#1452, D3D12 debug layer id 553): never calls `reset_one(current_target)`
-/// while `in_flight(current_target)` is true. On failure, leaves `current_target` closed and marks
-/// `wrapper` unreset so neither a subsequent `KickoffX` nor `ExecuteCommandLists` can resubmit
-/// the already-submitted in-flight recording.
+/// `current_target`. When `swap_enabled` is false (the default unless `XCL_KICKOFF_SWAP=1`), resets
+/// `current_target` directly without touching spares or switching active backing lists. Otherwise
+/// preserves the idle-list invariant (#1452, D3D12 debug layer id 553): never calls
+/// `reset_one(current_target)` while `in_flight(current_target)` is true. Caps per-wrapper spares
+/// at `max_spares`, and when no idle spare is available falls back to `wait_idle(current_target)`
+/// before resetting `current_target` so subsequent commands are not dropped. Only marks `wrapper`
+/// unreset if that bounded wait or `Reset` itself fails.
+#[allow(clippy::too_many_arguments)]
 unsafe fn acquire_kickoff_target(
     wrapper: Option<*mut c_void>,
     current_target: *mut c_void,
     swap_enabled: bool,
+    max_spares: usize,
     mut in_flight: impl FnMut(*mut c_void) -> bool,
     mut create_spare: impl FnMut() -> Option<*mut c_void>,
+    mut wait_idle: impl FnMut(*mut c_void) -> bool,
     mut reset_one: impl FnMut(*mut c_void) -> i32,
 ) -> Result<*mut c_void, i32> {
     const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
@@ -3320,7 +3343,7 @@ unsafe fn acquire_kickoff_target(
         last_err = Some(hr);
         failed_spares.push(cand);
     }
-    if switched.is_none() {
+    if switched.is_none() && super::title_list::spare_count(w) + failed_spares.len() < max_spares {
         if let Some(cand) = create_spare() {
             if cand != current_target && !in_flight(cand) {
                 let hr = reset_one(cand);
@@ -3345,9 +3368,10 @@ unsafe fn acquire_kickoff_target(
         return Ok(cand);
     }
 
-    if !in_flight(current_target) {
+    if !in_flight(current_target) || wait_idle(current_target) {
         let hr = reset_one(current_target);
         if hr >= 0 {
+            super::title_list::clear_kickoff_unreset(w);
             return Ok(current_target);
         }
         super::title_list::mark_kickoff_unreset(w);
@@ -3368,6 +3392,10 @@ unsafe fn acquire_kickoff_target(
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
+    kickoff_x_with(this, kickoff_swap_enabled());
+}
+
+unsafe fn kickoff_x_with(this: *mut c_void, swap_enabled: bool) {
     static NO_QUEUE: AtomicU64 = AtomicU64::new(0);
     static ERR: AtomicU64 = AtomicU64::new(0);
     let ty = list_type(this);
@@ -3437,10 +3465,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
-    // Capture wrapper before `reclaim_for_kickoff` updates `WRAPPER_OF` (skipped when
-    // `XCL_KICKOFF_SWAP=0`). If this list was split mid-recording around a `Wait64`, flush
+    // Capture wrapper before `reclaim_for_kickoff` updates `WRAPPER_OF` (only when
+    // `XCL_KICKOFF_SWAP=1`). If this list was split mid-recording around a `Wait64`, flush
     // earlier closed segments in order before `this`.
-    let swap_enabled = kickoff_swap_enabled();
     let wrapper = swap_enabled.then(|| super::title_list::wrapper_of(this)).flatten();
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
@@ -3483,7 +3510,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         Some((primary, prior, reclaimed)) => (primary, prior, reclaimed),
         None => (this, Vec::new(), Vec::new()),
     };
-    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY { 0 } else { super::pso_async::resolve_for_bind(bound_pso) };
+    let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let reset_one = |pc_list: *mut c_void| -> i32 {
         let ext_closed = *(pc_list as *const usize);
         let hr = super::alloc_pool::reset_list(pc_list as usize, alloc, list_type(pc_list).0, |pc_alloc| {
@@ -3492,16 +3519,18 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         real::preserve_vtable(pc_list, ext_closed);
         hr
     };
-    // Avoid resuming on a PC command list whose submit is still in flight on the GPU (#1452,
-    // debug layer id 553): pick `primary` once idle, else an idle spare, else a fresh closed spare.
-    // If no idle candidate can be created or reset while `current_target` is in flight, leave it
-    // closed and suppress `push_segments` until the title's next `Reset`.
+    // When `XCL_KICKOFF_SWAP=1`, avoid resuming on a PC command list whose submit is still in
+    // flight on the GPU (#1452, debug layer id 553): pick `primary` once idle, else an idle spare,
+    // else a fresh closed spare up to `MAX_KICKOFF_SPARES`, else wait on `current_target`'s last
+    // submit fence before resetting it.
     let target = match acquire_kickoff_target(
         wrapper,
         current_target,
         swap_enabled,
+        MAX_KICKOFF_SPARES,
         |p| super::alloc_pool::in_flight(p as usize),
-        || create_closed_spare(current_target, ty, alloc),
+        || create_kickoff_spare(current_target, ty, alloc),
+        |p| device_of(p).is_some_and(|dev| super::alloc_pool::wait_idle(p as usize, &dev, KICKOFF_IDLE_WAIT_MS)),
         reset_one,
     ) {
         Ok(t) => t,
@@ -3509,10 +3538,6 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
         }
     };
-    super::dred::reset(target);
-    if init_pso != 0 {
-        super::dred::mark_pipeline(target, bound_pso, init_pso);
-    }
     if target != this {
         let (ended_early, pred_buf_obj, bindings_copy) = {
             let mut g = LISTS.lock().unwrap();
@@ -3597,13 +3622,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(target, PC_OM_SET_DEPTH_BOUNDS)(target, min, max);
         }
     }
-    if ty != D3D12_COMMAND_LIST_TYPE_COPY {
-        if let (Some(op), Some(pb)) = (predication, pred_buf) {
-            transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
-            pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
-                s.pred_in_state = true;
-            }
+    if let (Some(op), Some(pb)) = (predication, pred_buf) {
+        transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+            s.pred_in_state = true;
         }
     }
 }
@@ -7634,8 +7657,8 @@ mod tests {
 
             q.Wait(&gate, 1).unwrap();
             assert_eq!(segs(), vec![primary]);
-            // KickoffX #1 & #2 while gated: must switch primary -> s1 -> s2 with 0 resubmits and keep bindings.
-            kickoff_x(primary);
+            // KickoffX #1 & #2 while gated (with XCL_KICKOFF_SWAP=1): must switch primary -> s1 -> s2 with 0 resubmits and keep bindings.
+            kickoff_x_with(primary, true);
             let s1 = segs();
             assert_eq!(s1.len(), 1);
             let resub1 = super::super::alloc_pool::note_resubmits(q_raw, &s1);
@@ -7644,7 +7667,7 @@ mod tests {
                 let s = g.as_ref().unwrap().get(&(s1[0] as usize)).unwrap();
                 (s.bindings.stencil, s.bindings.topology, s.last_queue)
             };
-            kickoff_x(s1[0]);
+            kickoff_x_with(s1[0], true);
             let s2 = segs();
             assert_eq!(s2.len(), 1);
             let resub2 = super::super::alloc_pool::note_resubmits(q_raw, &s2);
@@ -7657,7 +7680,7 @@ mod tests {
             gate.Signal(1).unwrap();
             q.Signal(&done, 1).unwrap();
             crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("queue drains");
-            kickoff_x(s2[0]);
+            kickoff_x_with(s2[0], true);
             let after_drain = segs();
             assert_eq!(close(w), 0);
             let resub3 = super::super::alloc_pool::note_resubmits(q_raw, &after_drain);
@@ -7703,7 +7726,7 @@ mod tests {
             assert!(split_segs[0] == primary && seg1 != primary);
 
             q.Wait(&gate, 1).unwrap();
-            kickoff_x(seg1);
+            kickoff_x_with(seg1, true);
             let mut after = Vec::new();
             assert!(super::super::title_list::push_segments(w, &mut after));
             assert_eq!((after.len(), close(w)), (1, 0));
@@ -7755,39 +7778,44 @@ mod tests {
             super::super::alloc_pool::executed(q_raw, &one);
             assert!(super::super::alloc_pool::in_flight(primary as usize));
 
-            // 1. No pooled spare and `create_spare` fails (`None`): must never call `reset_one(primary)`
-            //    even though `reset_one` would return `S_OK`, and must suppress subsequent submits.
+            // 1. No pooled spare, `create_spare` fails (`None`), and bounded fence wait fails:
+            //    must never call `reset_one(primary)` even though `reset_one` would return `S_OK`,
+            //    and must suppress subsequent submits.
             let mut reset_calls = Vec::new();
             let res_no_spare = acquire_kickoff_target(
                 Some(w),
                 primary,
                 true,
+                MAX_KICKOFF_SPARES,
                 |p| super::super::alloc_pool::in_flight(p as usize),
                 || None,
+                |_| false,
                 |p| { reset_calls.push(p); 0 },
             );
             assert_eq!(res_no_spare, Err(E_OUTOFMEMORY));
-            assert!(reset_calls.is_empty(), "in-flight primary must never be reset when spare creation fails");
+            assert!(reset_calls.is_empty(), "in-flight primary must never be reset when spare creation and wait fail");
             let empty = segs();
             assert!(empty.is_empty(), "unreset kickoff wrapper must not expose in-flight primary to ExecuteCommandLists");
             assert!(close(w) < 0, "in-flight primary must remain closed");
-            kickoff_x(primary);
+            kickoff_x_with(primary, true);
             assert!(segs().is_empty());
             let mut exec_batches = 0usize;
             execute_with_waits_on(q_raw, &empty, |_| exec_batches += 1);
             assert_eq!(exec_batches, 0);
 
-            // 2. Pooled idle spare `s_fail` fails `Reset`: must never fall back to in-flight `primary`,
-            //    must return `s_fail` to the spare pool, and must keep `push_segments` empty.
-            let s_fail = create_closed_spare(primary, ty, a).expect("spare 1");
+            // 2. Pooled idle spare `s_fail` fails `Reset` and wait fails: must never fall back to
+            //    in-flight `primary`, must return `s_fail` to the spare pool, and keep `push_segments` empty.
+            let s_fail = create_kickoff_spare(primary, ty, a).expect("spare 1");
             super::super::title_list::put_spare(w, s_fail);
             reset_calls.clear();
             let res_spare_err = acquire_kickoff_target(
                 Some(w),
                 primary,
                 true,
+                MAX_KICKOFF_SPARES,
                 |p| super::super::alloc_pool::in_flight(p as usize),
                 || None,
+                |_| false,
                 |p| { reset_calls.push(p); if p == s_fail { E_OUTOFMEMORY } else { 0 } },
             );
             assert_eq!(res_spare_err, Err(E_OUTOFMEMORY));
@@ -7797,7 +7825,7 @@ mod tests {
             // 3. With a second idle spare `s_good` behind `s_fail`, `acquire_kickoff_target` skips
             //    `s_fail`, switches to `s_good`, and keeps `s_fail` pooled with 0 resubmits.
             assert_eq!(super::super::title_list::pop_spare(w), Some(s_fail));
-            let s_good = create_closed_spare(primary, ty, a).expect("spare 2");
+            let s_good = create_kickoff_spare(primary, ty, a).expect("spare 2");
             super::super::title_list::put_spare(w, s_good);
             super::super::title_list::put_spare(w, s_fail);
             reset_calls.clear();
@@ -7805,8 +7833,10 @@ mod tests {
                 Some(w),
                 primary,
                 true,
+                MAX_KICKOFF_SPARES,
                 |p| super::super::alloc_pool::in_flight(p as usize),
                 || None,
+                |_| false,
                 |p| { reset_calls.push(p); if p == s_fail { E_OUTOFMEMORY } else { reset_pc(p, a, 0) } },
             );
             assert_eq!(res_recovered, Ok(s_good));
@@ -7832,20 +7862,142 @@ mod tests {
         }
     }
 
+    /// Per-wrapper `KickoffX` spares must be capped at `MAX_KICKOFF_SPARES`, and when no idle
+    /// spare is available (cap reached or spare creation fails), `acquire_kickoff_target` must
+    /// wait on `current_target`'s last submit fence (releasing `alloc_pool` locks while waiting)
+    /// and reset `current_target` in place so subsequent commands are not dropped.
     #[test]
-    fn kickoff_swap_enabled_val_defaults_on_and_disables_on_zero() {
-        assert!(kickoff_swap_enabled_val(None));
-        assert!(kickoff_swap_enabled_val(Some("")));
-        assert!(kickoff_swap_enabled_val(Some("1")));
-        assert!(kickoff_swap_enabled_val(Some("true")));
-        assert!(!kickoff_swap_enabled_val(Some("0")));
-        assert!(!kickoff_swap_enabled_val(Some(" 0 ")));
+    fn kickoff_x_spare_cap_and_fence_wait_fallback_recovers_without_dropping_commands() {
+        struct SendFence(ID3D12Fence);
+        unsafe impl Send for SendFence {}
+
+        let _guard = KICKOFF_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = test_device_or_warp() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+        unsafe {
+            let (q, alloc, primary, w, gate, done) = kickoff_test_setup(&dev);
+            let (q_raw, a) = (q.as_raw(), alloc.as_raw() as usize);
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(w as *const *const usize)).add(9));
+            let reset_w: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(*(*(w as *const *const usize)).add(10));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            let segs = || { let mut v = Vec::new(); assert!(super::super::title_list::push_segments(w, &mut v)); v };
+
+            // 1. With no spares pooled and `create_spare` failing (`None`) while `primary` is in
+            //    flight, fence-wait fallback waits for `primary` (releasing `alloc_pool::STATE`
+            //    while waiting) and resets it in place without dropping commands.
+            q.Wait(&gate, 1).unwrap();
+            assert_eq!(close(w), 0);
+            let one_p = [primary];
+            exec(q_raw, 1, one_p.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &one_p);
+            assert!(super::super::alloc_pool::in_flight(primary as usize));
+
+            let gate_t1 = SendFence(gate.clone());
+            let primary_addr = primary as usize;
+            let unblocker1 = std::thread::spawn(move || {
+                let gate_t1 = gate_t1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                assert!(super::super::alloc_pool::in_flight(primary_addr));
+                gate_t1.0.Signal(1).unwrap();
+            });
+            let res_oom_wait = acquire_kickoff_target(
+                Some(w),
+                primary,
+                true,
+                MAX_KICKOFF_SPARES,
+                |p| super::super::alloc_pool::in_flight(p as usize),
+                || None,
+                |p| super::super::alloc_pool::wait_idle(p as usize, &dev, KICKOFF_IDLE_WAIT_MS),
+                |p| reset_pc(p, a, 0),
+            );
+            unblocker1.join().unwrap();
+            assert_eq!(res_oom_wait, Ok(primary), "fence-wait fallback must recover primary on spare creation failure");
+            assert_eq!(segs(), vec![primary]);
+            assert_eq!(super::super::alloc_pool::note_resubmits(q_raw, &[primary]), 0);
+            assert_eq!(close(w), 0);
+            exec(q_raw, 1, one_p.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &one_p);
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("oom wait fallback drains");
+            assert_eq!(reset_w(w, a, 0), 0);
+            assert_eq!(segs(), vec![primary]);
+
+            // 2. Fill all `MAX_KICKOFF_SPARES` slots while `gate` holds every submit in flight.
+            q.Wait(&gate, 2).unwrap();
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(primary as usize);
+            let mut cur = primary;
+            for i in 0..MAX_KICKOFF_SPARES {
+                kickoff_x_with(cur, true);
+                let next = segs();
+                assert_eq!(next.len(), 1);
+                assert_eq!(super::super::alloc_pool::note_resubmits(q_raw, &next), 0);
+                assert!(seen.insert(next[0] as usize), "spare #{i} must be distinct");
+                assert_eq!(super::super::title_list::spare_count(w), i + 1);
+                cur = next[0];
+            }
+            // Submit `cur` (spare #8) so `primary` and all 8 spares are simultaneously in flight.
+            assert_eq!(close(w), 0);
+            let one = [cur];
+            exec(q_raw, 1, one.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &one);
+            assert!(super::super::alloc_pool::in_flight(cur as usize));
+
+            let gate_t2 = SendFence(gate.clone());
+            let cur_addr = cur as usize;
+            let unblocker2 = std::thread::spawn(move || {
+                let gate_t2 = gate_t2;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                assert!(super::super::alloc_pool::in_flight(cur_addr));
+                gate_t2.0.Signal(2).unwrap();
+            });
+            let mut create_calls = 0usize;
+            let res_capped = acquire_kickoff_target(
+                Some(w),
+                cur,
+                true,
+                MAX_KICKOFF_SPARES,
+                |p| super::super::alloc_pool::in_flight(p as usize),
+                || { create_calls += 1; None },
+                |p| super::super::alloc_pool::wait_idle(p as usize, &dev, KICKOFF_IDLE_WAIT_MS),
+                |p| reset_pc(p, a, 0),
+            );
+            unblocker2.join().unwrap();
+            assert_eq!(create_calls, 0, "cap must prevent allocating past MAX_KICKOFF_SPARES");
+            assert_eq!(res_capped, Ok(cur), "bounded fence wait must recover current_target in place");
+            assert_eq!(super::super::title_list::spare_count(w), MAX_KICKOFF_SPARES);
+            let after_cap = segs();
+            assert_eq!(after_cap, vec![cur]);
+            assert_eq!(super::super::alloc_pool::note_resubmits(q_raw, &after_cap), 0);
+            assert_eq!(close(w), 0);
+            exec(q_raw, 1, after_cap.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &after_cap);
+            q.Signal(&done, 2).unwrap();
+            crate::gpu::fence::wait(&done, 2, &dev, None, 5000).expect("capped fallback drains");
+
+            let removed = dev.GetDeviceRemovedReason();
+            assert_eq!(release(w), 0);
+            drop(q);
+            assert!(removed.is_ok());
+        }
     }
 
-    /// With `XCL_KICKOFF_SWAP=0` (`swap_enabled == false`), `acquire_kickoff_target` keeps
-    /// `current_target` directly without checking `in_flight`, popping/creating spares, switching
-    /// the active backing list, or marking the wrapper unreset — even while `current_target` is
-    /// still in flight on the GPU.
+    #[test]
+    fn kickoff_swap_enabled_val_defaults_off_and_enables_on_one() {
+        assert!(!kickoff_swap_enabled_val(None));
+        assert!(!kickoff_swap_enabled_val(Some("")));
+        assert!(!kickoff_swap_enabled_val(Some("0")));
+        assert!(!kickoff_swap_enabled_val(Some("false")));
+        assert!(!kickoff_swap_enabled_val(Some("true")));
+        assert!(kickoff_swap_enabled_val(Some("1")));
+        assert!(kickoff_swap_enabled_val(Some(" 1 ")));
+    }
+
+    /// With `XCL_KICKOFF_SWAP` unset/off (`swap_enabled == false`, the default),
+    /// `acquire_kickoff_target` keeps `current_target` directly without checking `in_flight`,
+    /// popping/creating spares, waiting on fences, switching the active backing list, or marking
+    /// the wrapper unreset — even while `current_target` is still in flight on the GPU.
     #[test]
     fn kickoff_swap_disabled_keeps_current_target_without_spares() {
         const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
@@ -7868,46 +8020,52 @@ mod tests {
             super::super::alloc_pool::executed(q_raw, &one);
             assert!(super::super::alloc_pool::in_flight(primary as usize));
 
-            let pooled_spare = create_closed_spare(primary, ty, a).expect("pooled spare");
+            let pooled_spare = create_kickoff_spare(primary, ty, a).expect("pooled spare");
             super::super::title_list::put_spare(w, pooled_spare);
 
             let mut in_flight_calls = 0usize;
             let mut create_calls = 0usize;
+            let mut wait_calls = 0usize;
             let mut reset_calls = Vec::new();
             let res = acquire_kickoff_target(
                 Some(w),
                 primary,
                 false,
+                MAX_KICKOFF_SPARES,
                 |p| { in_flight_calls += 1; super::super::alloc_pool::in_flight(p as usize) },
-                || { create_calls += 1; create_closed_spare(primary, ty, a) },
+                || { create_calls += 1; create_kickoff_spare(primary, ty, a) },
+                |_| { wait_calls += 1; true },
                 |p| { reset_calls.push(p); 0 },
             );
             assert_eq!(res, Ok(primary));
             assert_eq!(reset_calls, vec![primary]);
-            assert_eq!(in_flight_calls, 0, "opt-out must bypass in-flight spare selection");
-            assert_eq!(create_calls, 0, "opt-out must not create spares");
+            assert_eq!(in_flight_calls, 0, "default-off must bypass in-flight spare selection");
+            assert_eq!(create_calls, 0, "default-off must not create spares");
+            assert_eq!(wait_calls, 0, "default-off must not wait on fences");
             assert_eq!(segs(), vec![primary], "wrapper active target must stay primary");
-            assert_eq!(super::super::title_list::pop_spare(w), Some(pooled_spare), "opt-out must not pop pooled spares");
+            assert_eq!(super::super::title_list::pop_spare(w), Some(pooled_spare), "default-off must not pop pooled spares");
 
-            // Failed Reset while opted out returns Err without marking kickoff_unreset.
+            // Failed Reset while disabled returns Err without marking kickoff_unreset.
             super::super::title_list::put_spare(w, pooled_spare);
             let err = acquire_kickoff_target(
                 Some(w),
                 primary,
                 false,
+                MAX_KICKOFF_SPARES,
                 |_| { in_flight_calls += 1; true },
                 || { create_calls += 1; None },
+                |_| { wait_calls += 1; false },
                 |_| E_OUTOFMEMORY,
             );
             assert_eq!(err, Err(E_OUTOFMEMORY));
-            assert_eq!((in_flight_calls, create_calls), (0, 0));
+            assert_eq!((in_flight_calls, create_calls, wait_calls), (0, 0, 0));
             assert_eq!(segs(), vec![primary]);
             assert_eq!(super::super::title_list::pop_spare(w), Some(pooled_spare));
             super::super::title_list::put_spare(w, pooled_spare);
 
             gate.Signal(1).unwrap();
             q.Signal(&done, 1).unwrap();
-            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("opt-out queue drains");
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("default-off queue drains");
             let removed = dev.GetDeviceRemovedReason();
             assert_eq!(release(w), 0);
             drop(q);

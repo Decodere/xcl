@@ -318,6 +318,22 @@ pub(super) fn mark_kickoff_unreset(wrapper: *mut c_void) {
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().kickoff_unreset = true;
 }
 
+/// Clear `kickoff_unreset` after `KickoffX` resets `current_target` in place.
+pub(super) fn clear_kickoff_unreset(wrapper: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    if let Some(b) = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize))) {
+        b.kickoff_unreset = false;
+    }
+}
+
+/// Number of non-primary spare PC lists currently owned by `wrapper` (pooled or active stand-in).
+pub(super) fn spare_count(wrapper: *mut c_void) -> usize {
+    let sg = SEGMENTS.lock().unwrap();
+    sg.as_ref()
+        .and_then(|m| m.get(&(wrapper as usize)))
+        .map_or(0, |b| b.spares.len() + usize::from(b.first.is_some()) + b.extra_active.len())
+}
+
 /// Whether `wrapper` may allocate/activate `n` more split segments for this recording.
 pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
     let sg = SEGMENTS.lock().unwrap();
