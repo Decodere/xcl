@@ -1702,8 +1702,13 @@ mod frame_dump_tests {
         }
     }
 
+    // D3D12CreateDevice(WARP) returns a process-wide singleton device that deduplicates identical
+    // root signatures, so tests checking `comp.root_sig` COM refcounts serialize against siblings.
+    static COMPOSITOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn compositor_blends_ui_plane_over_scene_plane() {
+        let _lock = COMPOSITOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
@@ -1864,6 +1869,7 @@ mod frame_dump_tests {
 
     #[test]
     fn compositor_releases_root_sig_and_rejects_invalid_planes() {
+        let _lock = COMPOSITOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let (dev, _alloc, list, mut comp) = warp_env();
             let refcount = |p: *mut c_void| -> u32 {
@@ -1873,9 +1879,12 @@ mod frame_dump_tests {
             };
             let before = refcount(comp.root_sig.as_raw());
             drop(comp.psos_for(&dev, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap());
-            assert!(comp.psos_for(&dev, DXGI_FORMAT_BC1_UNORM).is_none());
             comp.psos.clear();
-            assert_eq!(refcount(comp.root_sig.as_raw()), before, "psos_for leaked root_sig COM refs");
+            assert_eq!(refcount(comp.root_sig.as_raw()), before, "psos_for leaked root_sig COM refs on success");
+            // Blending on an integer RTV format with SV_Target0 is rejected with E_INVALIDARG by
+            // both Windows D3D12/WARP and vkd3d-proton (which accepts DXGI_FORMAT_BC1_UNORM).
+            assert!(comp.psos_for(&dev, DXGI_FORMAT_R8G8B8A8_UINT).is_none());
+            assert_eq!(refcount(comp.root_sig.as_raw()), before, "psos_for leaked root_sig COM refs on failure");
 
             let out = make_tex_2d(&dev, 8, 8, 1, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
             let ok = make_tex_2d(&dev, 4, 4, 1, D3D12_RESOURCE_FLAG_NONE);
@@ -1900,6 +1909,7 @@ mod frame_dump_tests {
 
     #[test]
     fn compositor_scales_single_plane_sub_rect() {
+        let _lock = COMPOSITOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let (dev, _alloc, list, mut comp) = warp_env();
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
