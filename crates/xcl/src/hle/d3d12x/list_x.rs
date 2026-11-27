@@ -3253,20 +3253,34 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
     apply_predication_copy(this, uma_buf, off, pb, D3D12_PREDICATION_OP(op_raw as i32));
 }
 
+fn kickoff_swap_enabled_val(val: Option<&str>) -> bool {
+    !val.is_some_and(|v| v.trim() == "0")
+}
+
+/// `XCL_KICKOFF_SWAP=0` disables switching `KickoffX` onto an idle spare PC list, falling back to
+/// resetting `current_target` directly without affecting `XCL_ALLOC_SWAP`.
+fn kickoff_swap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| kickoff_swap_enabled_val(std::env::var("XCL_KICKOFF_SWAP").ok().as_deref()))
+}
+
 /// Select and `Reset` the next active PC command list after `KickoffX` has submitted
-/// `current_target`. Preserves the idle-list invariant (#1452, D3D12 debug layer id 553): never
-/// calls `reset_one(current_target)` while `in_flight(current_target)` is true. On failure, leaves
-/// `current_target` closed and marks `wrapper` unreset so neither a subsequent `KickoffX` nor
-/// `ExecuteCommandLists` can resubmit the already-submitted in-flight recording.
+/// `current_target`. When `swap_enabled` is false (`XCL_KICKOFF_SWAP=0`), resets `current_target`
+/// directly without touching spares or switching active backing lists. Otherwise preserves the
+/// idle-list invariant (#1452, D3D12 debug layer id 553): never calls `reset_one(current_target)`
+/// while `in_flight(current_target)` is true. On failure, leaves `current_target` closed and marks
+/// `wrapper` unreset so neither a subsequent `KickoffX` nor `ExecuteCommandLists` can resubmit
+/// the already-submitted in-flight recording.
 unsafe fn acquire_kickoff_target(
     wrapper: Option<*mut c_void>,
     current_target: *mut c_void,
+    swap_enabled: bool,
     mut in_flight: impl FnMut(*mut c_void) -> bool,
     mut create_spare: impl FnMut() -> Option<*mut c_void>,
     mut reset_one: impl FnMut(*mut c_void) -> i32,
 ) -> Result<*mut c_void, i32> {
     const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
-    let Some(w) = wrapper else {
+    let Some(w) = wrapper.filter(|_| swap_enabled) else {
         let hr = reset_one(current_target);
         return if hr >= 0 { Ok(current_target) } else { Err(hr) };
     };
@@ -3423,9 +3437,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
-    // Capture wrapper before `reclaim_for_kickoff` updates `WRAPPER_OF`. If this list was split
-    // mid-recording around a `Wait64`, flush earlier closed segments in order before `this`.
-    let wrapper = super::title_list::wrapper_of(this);
+    // Capture wrapper before `reclaim_for_kickoff` updates `WRAPPER_OF` (skipped when
+    // `XCL_KICKOFF_SWAP=0`). If this list was split mid-recording around a `Wait64`, flush
+    // earlier closed segments in order before `this`.
+    let swap_enabled = kickoff_swap_enabled();
+    let wrapper = swap_enabled.then(|| super::title_list::wrapper_of(this)).flatten();
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
@@ -3483,6 +3499,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let target = match acquire_kickoff_target(
         wrapper,
         current_target,
+        swap_enabled,
         |p| super::alloc_pool::in_flight(p as usize),
         || create_closed_spare(current_target, ty, alloc),
         reset_one,
@@ -7744,6 +7761,7 @@ mod tests {
             let res_no_spare = acquire_kickoff_target(
                 Some(w),
                 primary,
+                true,
                 |p| super::super::alloc_pool::in_flight(p as usize),
                 || None,
                 |p| { reset_calls.push(p); 0 },
@@ -7767,6 +7785,7 @@ mod tests {
             let res_spare_err = acquire_kickoff_target(
                 Some(w),
                 primary,
+                true,
                 |p| super::super::alloc_pool::in_flight(p as usize),
                 || None,
                 |p| { reset_calls.push(p); if p == s_fail { E_OUTOFMEMORY } else { 0 } },
@@ -7785,6 +7804,7 @@ mod tests {
             let res_recovered = acquire_kickoff_target(
                 Some(w),
                 primary,
+                true,
                 |p| super::super::alloc_pool::in_flight(p as usize),
                 || None,
                 |p| { reset_calls.push(p); if p == s_fail { E_OUTOFMEMORY } else { reset_pc(p, a, 0) } },
@@ -7805,6 +7825,89 @@ mod tests {
             assert_eq!(reset_w(w, a, 0), 0);
             assert_eq!(segs(), vec![primary]);
             assert_eq!(close(w), 0);
+            let removed = dev.GetDeviceRemovedReason();
+            assert_eq!(release(w), 0);
+            drop(q);
+            assert!(removed.is_ok());
+        }
+    }
+
+    #[test]
+    fn kickoff_swap_enabled_val_defaults_on_and_disables_on_zero() {
+        assert!(kickoff_swap_enabled_val(None));
+        assert!(kickoff_swap_enabled_val(Some("")));
+        assert!(kickoff_swap_enabled_val(Some("1")));
+        assert!(kickoff_swap_enabled_val(Some("true")));
+        assert!(!kickoff_swap_enabled_val(Some("0")));
+        assert!(!kickoff_swap_enabled_val(Some(" 0 ")));
+    }
+
+    /// With `XCL_KICKOFF_SWAP=0` (`swap_enabled == false`), `acquire_kickoff_target` keeps
+    /// `current_target` directly without checking `in_flight`, popping/creating spares, switching
+    /// the active backing list, or marking the wrapper unreset — even while `current_target` is
+    /// still in flight on the GPU.
+    #[test]
+    fn kickoff_swap_disabled_keeps_current_target_without_spares() {
+        const E_OUTOFMEMORY: i32 = 0x8007_000Eu32 as i32;
+        let _guard = KICKOFF_GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = test_device_or_warp() else { return crate::gpu::recomp::runner::skip_test("no GPU or WARP"); };
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let (q, alloc, primary, w, gate, done) = kickoff_test_setup(&dev);
+            let (q_raw, a) = (q.as_raw(), alloc.as_raw() as usize);
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(w as *const *const usize)).add(9));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                std::mem::transmute(real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            let segs = || { let mut v = Vec::new(); assert!(super::super::title_list::push_segments(w, &mut v)); v };
+
+            q.Wait(&gate, 1).unwrap();
+            assert_eq!(close(w), 0);
+            let one = [primary];
+            exec(q_raw, 1, one.as_ptr());
+            super::super::alloc_pool::executed(q_raw, &one);
+            assert!(super::super::alloc_pool::in_flight(primary as usize));
+
+            let pooled_spare = create_closed_spare(primary, ty, a).expect("pooled spare");
+            super::super::title_list::put_spare(w, pooled_spare);
+
+            let mut in_flight_calls = 0usize;
+            let mut create_calls = 0usize;
+            let mut reset_calls = Vec::new();
+            let res = acquire_kickoff_target(
+                Some(w),
+                primary,
+                false,
+                |p| { in_flight_calls += 1; super::super::alloc_pool::in_flight(p as usize) },
+                || { create_calls += 1; create_closed_spare(primary, ty, a) },
+                |p| { reset_calls.push(p); 0 },
+            );
+            assert_eq!(res, Ok(primary));
+            assert_eq!(reset_calls, vec![primary]);
+            assert_eq!(in_flight_calls, 0, "opt-out must bypass in-flight spare selection");
+            assert_eq!(create_calls, 0, "opt-out must not create spares");
+            assert_eq!(segs(), vec![primary], "wrapper active target must stay primary");
+            assert_eq!(super::super::title_list::pop_spare(w), Some(pooled_spare), "opt-out must not pop pooled spares");
+
+            // Failed Reset while opted out returns Err without marking kickoff_unreset.
+            super::super::title_list::put_spare(w, pooled_spare);
+            let err = acquire_kickoff_target(
+                Some(w),
+                primary,
+                false,
+                |_| { in_flight_calls += 1; true },
+                || { create_calls += 1; None },
+                |_| E_OUTOFMEMORY,
+            );
+            assert_eq!(err, Err(E_OUTOFMEMORY));
+            assert_eq!((in_flight_calls, create_calls), (0, 0));
+            assert_eq!(segs(), vec![primary]);
+            assert_eq!(super::super::title_list::pop_spare(w), Some(pooled_spare));
+            super::super::title_list::put_spare(w, pooled_spare);
+
+            gate.Signal(1).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("opt-out queue drains");
             let removed = dev.GetDeviceRemovedReason();
             assert_eq!(release(w), 0);
             drop(q);
