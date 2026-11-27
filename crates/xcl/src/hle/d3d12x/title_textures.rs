@@ -2137,17 +2137,19 @@ unsafe fn upload_target(title: Option<&ID3D12CommandQueue>) -> Target {
 /// textures with something to send again (`texture_upload::sent`)
 static AGAIN: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
 
+type SubmitBatch = (Vec<(usize, String)>, u64, Option<texture_upload::Sent>);
+
 /// Upload `items` on `queue`, a DIRECT one: the ones that could not be, the bytes of the others and
 /// where they went (None: there were none).
-unsafe fn submit_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[texture_upload::Item]) -> Result<(Vec<(usize, String)>, u64, Option<texture_upload::Sent>), String> {
+unsafe fn submit_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[texture_upload::Item]) -> Result<SubmitBatch, texture_upload::SubmitError> {
     let mut g = ON_QUEUE.lock().unwrap();
     let key = queue.as_raw() as usize;
     if let std::collections::btree_map::Entry::Vacant(e) = g.entry(key) {
         // (before anything runs that it would have to follow)
-        let fence = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).map_err(|e| e.to_string())?;
+        let fence = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).map_err(|e| texture_upload::SubmitError::from_win("texture upload", e))?;
         e.insert(QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
     }
-    let Some(q) = g.get_mut(&key) else { return Err("no fence for the queue".into()) };
+    let Some(q) = g.get_mut(&key) else { return Err(texture_upload::SubmitError::Failed("no fence for the queue".into())) };
     let (failed, f, bytes) = texture_upload::submit(dev, queue, items)?;
     let Some(f) = f else { return Ok((failed, 0, None)) };
     if let Err(e) = queue.Signal(&q.fence, q.value + 1) {
@@ -2156,7 +2158,7 @@ unsafe fn submit_on(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[tex
             Ok(()) => drop(f),
             Err(_) => std::mem::forget(f),
         }
-        return Err(e.to_string());
+        return Err(texture_upload::SubmitError::from_win("texture upload", e));
     }
     q.value += 1;
     q.bytes += f.bytes;
@@ -2285,7 +2287,16 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
         let bytes = parts.map_or(size, |p| p.iter().map(|r| (r.1.div_ceil(BLOCK) - r.0 / BLOCK) * BLOCK).sum::<usize>().min(size));
         Some((d, changed, bytes))
     }).peekable();
+    let backoff_on = super::residency::enabled();
     while todo.peek().is_some() {
+        if backoff_on && !super::residency::admit_upload() {
+            super::residency::note_upload_deferred();
+            texture_upload::trim_free();
+            let at = std::time::Instant::now() + super::residency::retry_delay();
+            let mut g = RETRY.lock().unwrap();
+            defer_remaining(&mut g, at, todo);
+            break;
+        }
         let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::new(), Vec::new());
         let (mut bytes, mut device) = (0usize, 0usize);
         while let Some((d, mut changed, n)) = todo.next_if(|(d, _, n)| batch_fits(items.len(), bytes, device, d.device, *n)) {
@@ -2332,7 +2343,7 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             }
             // not from a compute or copy queue: on XCL's own, which the title's queues wait for
             None => {
-                let queue = upload_queue(dev, device)?;
+                let queue = upload_queue(dev, device).map_err(texture_upload::SubmitError::Failed)?;
                 super::vram::before_execute(&queue);
                 let r = submit_on(dev, &queue, &items)?;
                 if let Some(s) = &r.2 {
@@ -2361,8 +2372,21 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
                 super::submit_cost::textures_uploaded(items.len() - failed.len(), bytes as usize, t_submit.elapsed());
             }
             Err(e) => {
-                warn(&e);
+                let defer_all = backoff_on && matches!(e, texture_upload::SubmitError::Deferred(_) | texture_upload::SubmitError::Oom(_));
+                if !matches!(e, texture_upload::SubmitError::Deferred(_)) {
+                    warn(&e.to_string());
+                }
                 known.iter().for_each(texture_upload::forget);
+                if defer_all {
+                    texture_upload::trim_free();
+                    let at = std::time::Instant::now() + super::residency::retry_delay();
+                    let mut g = RETRY.lock().unwrap();
+                    for it in &items {
+                        push_retry(&mut g, at, it.res.as_raw() as usize);
+                    }
+                    defer_remaining(&mut g, at, todo);
+                    break;
+                }
                 // (no memory for a buffer, most likely: again in a moment)
                 let at = std::time::Instant::now() + RETRY_AFTER;
                 RETRY.lock().unwrap().extend(items.iter().map(|it| (at, it.res.as_raw() as usize)));
@@ -2375,25 +2399,62 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
 static RETRY: Mutex<Vec<(std::time::Instant, usize)>> = Mutex::new(Vec::new());
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
 
+fn push_retry(retry: &mut Vec<(std::time::Instant, usize)>, at: std::time::Instant, res: usize) {
+    if let Some(slot) = retry.iter_mut().find(|(_, r)| *r == res) {
+        slot.0 = slot.0.max(at);
+    } else {
+        retry.push((at, res));
+    }
+}
+
+fn defer_remaining(
+    retry: &mut Vec<(std::time::Instant, usize)>,
+    at: std::time::Instant,
+    todo: impl IntoIterator<Item = (Due, Option<Vec<(usize, usize)>>, usize)>,
+) {
+    for (d, _, _) in todo {
+        texture_upload::forget(&d.known);
+        push_retry(retry, at, d.res.as_raw() as usize);
+    }
+}
+
 /// Those whose time has come are to be uploaded as a whole, like new ones.
 fn retry_failed() {
+    if super::residency::enabled() && !super::residency::admit_upload() {
+        return;
+    }
     let mut g = RETRY.lock().unwrap();
     if g.is_empty() {
         return;
     }
-    let now = std::time::Instant::now();
     let mut t = TEXTURES.lock().unwrap();
-    g.retain(|&(at, res)| {
+    retry_failed_at(&mut g, &mut t, &PENDING, std::time::Instant::now(), true);
+}
+
+fn retry_failed_at(
+    retry: &mut Vec<(std::time::Instant, usize)>,
+    table: &mut Table,
+    pending: &std::sync::atomic::AtomicUsize,
+    now: std::time::Instant,
+    admitted: bool,
+) -> usize {
+    if !admitted || retry.is_empty() {
+        return 0;
+    }
+    let mut restored = 0usize;
+    retry.retain(|&(at, res)| {
         if at > now {
             return true;
         }
-        if let Some(e) = t.by_res.get_mut(&res).filter(|e| !e.pending && !e.gpu_written) {
+        if let Some(e) = table.by_res.get_mut(&res).filter(|e| !e.pending && !e.gpu_written) {
             e.pending = true;
-            PENDING.fetch_add(1, Ordering::Relaxed);
-            t.pending_res.insert(res);
+            pending.fetch_add(1, Ordering::Relaxed);
+            table.pending_res.insert(res);
+            restored += 1;
         }
         false
     });
+    restored
 }
 
 /// An upload of `changed` (None: all) of `res`, a texture of the console description `desc` with its
@@ -2405,7 +2466,7 @@ pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, re
         return Err(format!("{} bytes of {}", mem.len(), tex.size()));
     }
     let item = texture_upload::Item { res: res.clone(), src: mem.as_ptr() as usize, tex, states, changed, known: None, pages: None };
-    let (failed, job, _) = own_work(|| texture_upload::submit(dev, queue, &[item]))?;
+    let (failed, job, _) = own_work(|| texture_upload::submit(dev, queue, &[item])).map_err(|e| e.to_string())?;
     texture::wait(dev, queue)?;
     job.into_iter().for_each(texture_upload::give_back);
     failed.into_iter().next().map_or(Ok(()), |(_, e)| Err(e))
@@ -4698,5 +4759,75 @@ pub(super) mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    #[test]
+    fn upload_backoff_defers_without_dropping_dirty_or_pending_textures() {
+        let mut table = Table::new();
+        let pending = std::sync::atomic::AtomicUsize::new(0);
+        let desc = console_desc(3, 64, 64, 1, 1, 28, 0x109);
+        let tex = Arc::new(xg::Texture::new(&desc).unwrap());
+        let known_a: texture_upload::Known = Default::default();
+        let known_b: texture_upload::Known = Default::default();
+        // Seed known hashes as if A had been uploaded earlier, then dirtied & deferred.
+        let mut mem = vec![0x5Au8; tex.size() as usize];
+        texture_upload::all_sent(&known_a, mem.as_mut_ptr() as usize, mem.len());
+
+        for (res, va, known) in [(0x1001usize, 0x1000_0000usize, Arc::clone(&known_a)), (0x1002usize, 0x2000_0000usize, Arc::clone(&known_b))] {
+            table.by_res.insert(
+                res,
+                Entry {
+                    device: 1,
+                    va,
+                    src: va,
+                    in_gpu_view: false,
+                    paged: false,
+                    tex: Arc::clone(&tex),
+                    states: vec![D3D12_RESOURCE_STATE_COMMON],
+                    pending: false,
+                    gpu_written: false,
+                    written_call: 0,
+                    placed: false,
+                    unmapped: false,
+                    seq: res as u64,
+                    known,
+                    target: false,
+                },
+            );
+        }
+
+        let t0 = std::time::Instant::now();
+        let retry_at = t0 + std::time::Duration::from_millis(super::super::residency::UPLOAD_RETRY_MS);
+        let mut retry = Vec::new();
+        // Defer both A and B (including duplicate push for A): must forget known hashes and keep both unique.
+        texture_upload::forget(&known_a);
+        texture_upload::forget(&known_b);
+        push_retry(&mut retry, retry_at, 0x1001);
+        push_retry(&mut retry, retry_at, 0x1001);
+        push_retry(&mut retry, retry_at, 0x1002);
+        assert_eq!(retry.len(), 2);
+
+        // While admission is denied (low commit / active cooldown), nothing is popped or lost.
+        assert_eq!(retry_failed_at(&mut retry, &mut table, &pending, retry_at, false), 0);
+        assert_eq!(retry.len(), 2);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+
+        // Before the 500 ms deadline expires, entries stay queued even when commit recovers.
+        let before = t0 + std::time::Duration::from_millis(super::super::residency::UPLOAD_RETRY_MS - 1);
+        assert_eq!(retry_failed_at(&mut retry, &mut table, &pending, before, true), 0);
+        assert_eq!(retry.len(), 2);
+
+        // Once cooldown expires and commit is admitted, both textures are restored as pending whole uploads.
+        assert_eq!(retry_failed_at(&mut retry, &mut table, &pending, retry_at, true), 2);
+        assert!(retry.is_empty());
+        assert_eq!(pending.load(Ordering::Relaxed), 2);
+        assert!(table.by_res[&0x1001].pending && table.by_res[&0x1002].pending);
+        assert!(table.pending_res.contains(&0x1001) && table.pending_res.contains(&0x1002));
+        // Forgotten `known_a` forces a full re-upload on the next dirty look.
+        let p0 = (mem.as_ptr() as usize) & !0xFFF;
+        let change = unsafe {
+            texture_upload::changed(&[texture_upload::Written { src: mem.as_ptr() as usize, size: mem.len(), dirty: &[p0], known: &known_a, pages: None }], true).0.remove(0)
+        };
+        assert_eq!(change, texture_upload::Change::All);
     }
 }
