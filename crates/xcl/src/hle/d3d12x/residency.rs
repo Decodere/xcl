@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -55,10 +55,44 @@ pub struct Stats {
     pub free_trim_bytes: u64,
 }
 
+struct CommitSample {
+    next_sample: u64,
+    available: u64,
+    /// Bytes reserved by in-flight staging allocations not yet reflected in `GlobalMemoryStatusEx`.
+    pending_growth: u64,
+}
+
+impl CommitSample {
+    fn refresh_locked(&mut self, now: u64, query: impl FnOnce() -> Option<u64>) -> u64 {
+        if now >= self.next_sample {
+            self.next_sample = now.saturating_add(COMMIT_SAMPLE_MS);
+            if let Some(commit) = query() {
+                self.available = commit.saturating_sub(self.pending_growth);
+            }
+        }
+        self.available
+    }
+}
+
+/// Holds an in-flight staging growth reservation until the OS allocation call finishes so a
+/// concurrent 32 ms sample refresh cannot reset the debited headroom budget.
+pub(super) struct GrowthReservation<'a> {
+    res: Option<&'a Residency>,
+    bytes: u64,
+}
+
+impl Drop for GrowthReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(res) = self.res {
+            let mut g = res.commit.lock().unwrap();
+            g.pending_growth = g.pending_growth.saturating_sub(self.bytes);
+        }
+    }
+}
+
 /// Cooldown and cached OS commit-headroom state (isolated instances allow race-free unit/GPU tests).
 pub(super) struct Residency {
-    next_commit_sample: AtomicU64,
-    available_commit: AtomicU64,
+    commit: Mutex<CommitSample>,
     retry_upload_at: AtomicU64,
     deferrals: AtomicU64,
     oom_cooldowns: AtomicU64,
@@ -70,8 +104,7 @@ pub(super) struct Residency {
 impl Residency {
     pub(super) const fn new() -> Self {
         Self {
-            next_commit_sample: AtomicU64::new(0),
-            available_commit: AtomicU64::new(u64::MAX),
+            commit: Mutex::new(CommitSample { next_sample: 0, available: u64::MAX, pending_growth: 0 }),
             retry_upload_at: AtomicU64::new(0),
             deferrals: AtomicU64::new(0),
             oom_cooldowns: AtomicU64::new(0),
@@ -105,18 +138,7 @@ impl Residency {
     }
 
     pub(super) fn sample_commit_with(&self, now: u64, query: impl FnOnce() -> Option<u64>) -> u64 {
-        let next = self.next_commit_sample.load(Ordering::Acquire);
-        if now >= next
-            && self
-                .next_commit_sample
-                .compare_exchange(next, now.saturating_add(COMMIT_SAMPLE_MS), Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            if let Some(commit) = query() {
-                self.available_commit.store(commit, Ordering::Release);
-            }
-        }
-        self.available_commit.load(Ordering::Acquire)
+        self.commit.lock().unwrap().refresh_locked(now, query)
     }
 
     pub(super) fn admit_upload_with(&self, now: u64, active: bool, query: impl FnOnce() -> Option<u64>) -> bool {
@@ -129,6 +151,31 @@ impl Residency {
         has_upload_reserve(self.sample_commit_with(now, query))
     }
 
+    pub(super) fn reserve_staging_growth_with(
+        &self,
+        bytes: u64,
+        now: u64,
+        active: bool,
+        query: impl FnOnce() -> Option<u64>,
+    ) -> Option<GrowthReservation<'_>> {
+        if !active {
+            return Some(GrowthReservation { res: None, bytes: 0 });
+        }
+        if now < self.retry_upload_at.load(Ordering::Acquire) {
+            self.growth_denials.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let mut g = self.commit.lock().unwrap();
+        let avail = g.refresh_locked(now, query);
+        if !has_growth_reserve(avail, bytes) {
+            self.growth_denials.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        g.available = avail.saturating_sub(bytes);
+        g.pending_growth = g.pending_growth.saturating_add(bytes);
+        Some(GrowthReservation { res: Some(self), bytes })
+    }
+
     pub(super) fn allow_staging_growth_with(
         &self,
         bytes: u64,
@@ -136,18 +183,7 @@ impl Residency {
         active: bool,
         query: impl FnOnce() -> Option<u64>,
     ) -> bool {
-        if !active {
-            return true;
-        }
-        if now < self.retry_upload_at.load(Ordering::Acquire) {
-            self.growth_denials.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        let ok = has_growth_reserve(self.sample_commit_with(now, query), bytes);
-        if !ok {
-            self.growth_denials.fetch_add(1, Ordering::Relaxed);
-        }
-        ok
+        self.reserve_staging_growth_with(bytes, now, active, query).is_some()
     }
 
     pub(super) fn note_deferred(&self) {
@@ -211,7 +247,7 @@ pub fn allow_staging_growth(bytes: u64) -> bool {
     GLOBAL.allow_staging_growth_with(bytes, coarse_ms(), enabled(), query_avail_commit)
 }
 
-/// Delay before retrying deferred texture uploads (`>= 500 ms`).
+/// Delay before retrying deferred texture uploads (remaining cooldown, or `UPLOAD_RETRY_MS`).
 pub fn retry_delay() -> Duration {
     GLOBAL.retry_delay_at(coarse_ms())
 }
@@ -326,6 +362,34 @@ mod tests {
         });
         assert_eq!((c2, calls), (4096 * MIB, 2));
         assert!(r.allow_staging_growth_with(64 * MIB, 132, true, || unreachable!("must use refreshed sample")));
+    }
+
+    #[test]
+    fn staging_growth_debits_cached_sample_and_holds_in_flight_reservation() {
+        let r = Residency::new();
+        // 1,072 MiB leaves 48 MiB above the 1,024 MiB growth floor: the first 32 MiB grant passes
+        // (debiting cached headroom to 1,040 MiB), and a second 32 MiB grant within the 32 ms
+        // window is denied instead of dropping headroom to 1,008 MiB.
+        let g1 = r.reserve_staging_growth_with(32 * MIB, 100, true, || Some(1072 * MIB));
+        assert!(g1.is_some());
+        assert!(r.reserve_staging_growth_with(32 * MIB, 110, true, || unreachable!("must use debited sample")).is_none());
+        assert_eq!(r.stats().growth_denials, 1);
+
+        // Even if the 32 ms window rolls over while the first allocation is still in flight (before
+        // the OS reports the commit), a concurrent refresh subtracts the reserved bytes so it
+        // cannot reset the budget.
+        assert_eq!(r.sample_commit_with(132, || Some(1072 * MIB)), 1040 * MIB);
+        assert!(r.reserve_staging_growth_with(32 * MIB, 132, true, || unreachable!("must use debited refresh")).is_none());
+        assert_eq!(r.stats().growth_denials, 2);
+
+        // Once the first allocation finishes, its completed bytes remain debited for the rest of
+        // the current window; a subsequent window observing restored headroom admits growth again.
+        drop(g1);
+        assert!(!r.allow_staging_growth_with(32 * MIB, 140, true, || unreachable!("still within debited window")));
+        assert_eq!(r.stats().growth_denials, 3);
+        assert!(r.allow_staging_growth_with(32 * MIB, 164, true, || Some(1072 * MIB)));
+        assert!(!r.allow_staging_growth_with(32 * MIB, 165, true, || unreachable!("debited again in new window")));
+        assert_eq!(r.stats().growth_denials, 4);
     }
 
     #[test]

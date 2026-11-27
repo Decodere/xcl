@@ -806,10 +806,26 @@ impl std::fmt::Display for SubmitError {
 
 impl SubmitError {
     pub(super) fn from_win(prefix: &str, err: windows::core::Error) -> Self {
+        Self::from_win_in(
+            prefix,
+            err,
+            super::residency::global(),
+            super::residency::coarse_ms(),
+            super::residency::enabled(),
+        )
+    }
+
+    pub(super) fn from_win_in(
+        prefix: &str,
+        err: windows::core::Error,
+        res: &super::residency::Residency,
+        now: u64,
+        active: bool,
+    ) -> Self {
         let msg = format!("{prefix}: {err}");
         if err.code().0 == crate::util::E_OUTOFMEMORY {
-            if super::residency::allocation_error(err.code().0) {
-                super::residency::note_upload_deferred();
+            if res.record_allocation_error(err.code().0, now, active) {
+                res.note_deferred();
             }
             Self::Oom(msg)
         } else {
@@ -865,11 +881,18 @@ unsafe fn take_in(
         return Err(SubmitError::Deferred("texture upload: deferred under low commit headroom"));
     }
     let cap = capacity(bytes).ok_or_else(|| SubmitError::Failed("texture upload buffer size overflow".into()))?;
-    if active && !res.allow_staging_growth_with(cap, now, true, query_commit) {
-        trim_free_in(pool, res);
-        res.note_deferred();
-        return Err(SubmitError::Deferred("texture upload: staging growth deferred under low commit headroom"));
-    }
+    let _growth_guard = if active {
+        match res.reserve_staging_growth_with(cap, now, true, query_commit) {
+            Some(guard) => Some(guard),
+            None => {
+                trim_free_in(pool, res);
+                res.note_deferred();
+                return Err(SubmitError::Deferred("texture upload: staging growth deferred under low commit headroom"));
+            }
+        }
+    } else {
+        None
+    };
     let e = |x: windows::core::Error| {
         let msg = format!("texture upload: {x}");
         if x.code().0 == crate::util::E_OUTOFMEMORY {
