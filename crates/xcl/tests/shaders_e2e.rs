@@ -536,6 +536,70 @@ fn precompile_warms_hlsl_static_samplers_and_reports_base_shift() {
 }
 
 #[test]
+fn precompile_keeps_companion_programs_and_pixel_variants() {
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        xcl::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    }
+    use xcl::gpu::dxil::container::{signature_part, SigPartElement};
+    let (dir, cache) = (TempDir::new("two-program-ps"), TempDir::new("two-program-ps-cache"));
+    let ps_osg = signature_part(&[SigPartElement { stream: 0, name: "SV_Target".into(), index: 0, system_value: 64, comp_type: 3, register: 0, mask: 0xF, rw_mask: 0, min_precision: 0 }], &[]);
+    let mut code = static_sampler_code(0xF800_180F);
+    let mut second = static_sampler_code(0xF800_180F);
+    second[36..40].copy_from_slice(&0x0D0C_0B0Bu32.to_le_bytes());
+    code.extend_from_slice(&second);
+    let mut third = static_sampler_code(0xF800_180F);
+    third[36..40].copy_from_slice(&0x0D0C_0B0Cu32.to_le_bytes());
+    let blob = xbox_shader_with_osg(0, &[fssm(&code, &[(5, 1)]), fssm(&third, &[(5, 1)])], &ps_osg);
+    assert_eq!(xcl::gpu::xbox::parse(&blob).unwrap().fssm.iter().map(|f| f.programs.len()).collect::<Vec<_>>(), vec![2, 1]);
+    std::fs::write(dir.path().join("ps.bin"), blob).unwrap();
+    let run = || Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders", dir.path().to_str().unwrap(), "--precompile", "--windows", "1", "--split", "0"])
+        .env("XCL_DIRECT_DXIL", "0")
+        .env("XCL_DXIL_CACHE", cache.path())
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn xcl shaders --precompile");
+    let cold = run();
+    let text = String::from_utf8_lossy(&cold.stdout);
+    assert!(cold.status.success(), "{cold:?}");
+    assert!(text.contains("compiled 3, already cached 0, errors 0"), "{text}");
+    let warm = run();
+    let text = String::from_utf8_lossy(&warm.stdout);
+    assert!(warm.status.success(), "{warm:?}");
+    assert!(text.contains("compiled 0, already cached 3, errors 0"), "{text}");
+}
+
+#[test]
+fn precompile_keeps_a_pixel_variant_after_an_empty_first_variant() {
+    use xcl::gpu::dxil::container::{signature_part, SigPartElement};
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        xcl::gpu::recomp::runner::skip_test("no DXC");
+        return;
+    }
+    let (dir, cache) = (TempDir::new("empty-first-ps"), TempDir::new("empty-first-ps-cache"));
+    let ps_osg = signature_part(&[SigPartElement { stream: 0, name: "SV_Target".into(), index: 0, system_value: 64, comp_type: 3, register: 0, mask: 0xF, rw_mask: 0, min_precision: 0 }], &[]);
+    let blob = xbox_shader_with_osg(0, &[fssm(&[], &[(5, 1)]), fssm(&static_sampler_code(0xF800_180F), &[(5, 1)])], &ps_osg);
+    assert_eq!(xcl::gpu::xbox::parse(&blob).unwrap().fssm.iter().map(|f| f.programs.len()).collect::<Vec<_>>(), vec![0, 1]);
+    std::fs::write(dir.path().join("ps.bin"), blob).unwrap();
+    let run = || Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders", dir.path().to_str().unwrap(), "--precompile", "--windows", "1", "--split", "0"])
+        .env("XCL_DIRECT_DXIL", "0")
+        .env("XCL_DXIL_CACHE", cache.path())
+        .env_remove("XCL_TRANSLATED_CACHE")
+        .output()
+        .expect("spawn xcl shaders --precompile");
+    let cold = run();
+    let text = String::from_utf8_lossy(&cold.stdout);
+    assert!(cold.status.success(), "{cold:?}");
+    assert!(text.contains("compiled 1, already cached 0, errors 0"), "{text}");
+    let warm = run();
+    let text = String::from_utf8_lossy(&warm.stdout);
+    assert!(warm.status.success(), "{warm:?}");
+    assert!(text.contains("compiled 0, already cached 1, errors 0"), "{text}");
+}
+
+#[test]
 fn precompile_skips_incomplete_vs_while_warming_supported_vs() {
     use xcl::gpu::recomp::{dxc, pso};
     if std::env::var_os("XCL_SHADERS_E2E_CHILD").is_some() {
